@@ -4,6 +4,7 @@ import typing as ty
 from functools import cached_property
 from pathlib import Path
 
+import pandas as pd
 from bids2table import bids2table
 
 import bidsschematools as bst  # type: ignore[import]
@@ -74,10 +75,10 @@ class BIDSFile(File, bt.BIDSFile[Schema]):
         path: ty.Union[os.PathLike, str],
         dataset: ty.Optional["BIDSDataset"] = None,
         *,
-        entities: Optional[Dict[str, Union[Label, Index]]] = None,
-        datatype: Optional[str] = None,
-        suffix: Optional[str] = None,
-        extension: Optional[str] = None,
+        entities: ty.Optional[ty.Dict[str, ty.Union[bt.Label, bt.Index]]] = None,
+        datatype: ty.Optional[str] = None,
+        suffix: ty.Optional[str] = None,
+        extension: ty.Optional[str] = None,
     ):
         super().__init__(path, dataset)
         self.entities = entities or {}
@@ -96,11 +97,11 @@ class BIDSFile(File, bt.BIDSFile[Schema]):
         }
         return cls(
             row['file__file_path'],
-            self,
+            dataset,
             entities=entities,
-            datatype=row['ent_datatype'],
-            suffix=row['suffix'],
-            extension=row['ent_ext'],
+            datatype=row['ent__datatype'],
+            suffix=row['ent__suffix'],
+            extension=row['ent__ext'],
         )
 
     @cached_property
@@ -124,3 +125,63 @@ class BIDSDataset(bt.BIDSDataset[Schema]):
         self.ignored = []  # TODO
         self.modalities = []  # TODO
         self.entities = []  # TODO
+
+    @cached_property
+    def query_table(self):
+        table = self.table.set_index('file__file_path')
+        table['path'] = table.index
+        meta = pd.DataFrame([obj or {} for obj in table.meta__json], index=table.index)
+        filtered = table.iloc[:, ~table.columns.str.match(r'(ds|file|meta)__|ent__extra')].join(meta)
+        renamer = {f"ent__{self.schema.objects.entities[key].name}": key for key in self.schema.objects.entities}
+        renamer.update({
+            "ent__datatype": "datatype",
+            "ent__suffix": "suffix",
+            "ent__ext": "extension",
+        })
+        return filtered.rename(columns=renamer).dropna(axis=1, how='all')
+
+    @staticmethod
+    def _query(table, **filters):
+        for key, val in filters.items():
+            if val in (None, bt.NONE):
+                # TODO: Handle nan
+                table = table[~table[key].astype(bool)]
+                continue
+            elif val == bt.REQUIRED:
+                table = table.dropna(subset=key)
+                table = table[table[key].astype(bool)]
+                continue
+            elif val == bt.OPTIONAL:
+                continue
+            elif key not in table or len(table) == 0:
+                return []
+
+            table = table.dropna(subset=key)
+            # Check contains if values are list and target column is not
+            if isinstance(val, list) and pd.Series.any(table[key].apply(type) != list):
+                table = table[table[key] in val]
+            else:
+                table = table[table[key] == val]
+
+        return table.index.unique().to_list()
+
+    def get(self, **filters):
+        # Quick optimization
+        if not filters:
+            return self.table['file__file_path'].to_list()
+
+        return self._query(self.query_table, **filters)
+
+    def get_entities(self, entity: str, **filters):
+        table = self.query_table
+        if entity not in table:
+            return []
+
+        return self._query(table.set_index(entity), **filters)
+
+    def get_metadata(self, term: str, **filters):
+        table = self.query_table
+        if term not in table:
+            return []
+
+        return self._query(table.set_index(term), **filters)
